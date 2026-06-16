@@ -1,0 +1,169 @@
+"""
+Recolector principal (se ejecuta en cada run programado).
+
+Flujo:
+  1. Si el store está vacío y hay CSVs en seed/, siembra el histórico.
+  2. Descarga de la API los fills + funding NUEVOS (desde el último cursor).
+  3. Los normaliza y los acumula en store/ (dedupe por id) -> el repo es la "BBDD".
+  4. Reconstruye las posiciones nuevas (posteriores a la semilla) desde los fills.
+  5. Regenera site/data.json (semilla + API).  El dashboard lo lee solo.
+
+Si la API de futuros aún no está disponible (invite-only) o falla, el script
+NO rompe: regenera el dashboard con lo que haya en el store y avisa.
+
+Uso:
+  python collector/collect.py            # run normal
+  python collector/collect.py --probe    # sólo prueba endpoints y enseña respuesta cruda
+"""
+import os
+import sys
+import json
+import time
+import argparse
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(__file__))
+from pionex_client import PionexClient, PionexError       # noqa
+from compute import (load_jsonl, save_jsonl, build_positions_from_fills,   # noqa
+                     write_data_json)
+import seed_from_csv                                       # noqa
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STORE = os.path.join(HERE, "store")
+SITE = os.path.join(HERE, "site")
+POS_FP = os.path.join(STORE, "positions.jsonl")
+FILLS_FP = os.path.join(STORE, "fills.jsonl")
+FUND_FP = os.path.join(STORE, "funding.jsonl")
+STATE_FP = os.path.join(STORE, "state.json")
+DATA_FP = os.path.join(SITE, "data.json")
+DAY_MS = 24 * 3600 * 1000
+
+
+def _g(d, *keys, default=None):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return default
+
+
+def normalize_fill(r: dict) -> dict:
+    ts = int(_g(r, "timestamp", "time", "createTime", "updateTime", default=0))
+    qty = float(_g(r, "filledSize", "size", "executed_qty", "qty", default=0) or 0)
+    price = float(_g(r, "price", default=0) or 0)
+    amount = _g(r, "filledAmount", "amount", "value")
+    amount = float(amount) if amount not in (None, "") else qty * price
+    return {
+        "fill_id": str(_g(r, "fillId", "tradeId", "id", default=f"{ts}-{qty}-{price}")),
+        "t": pd.to_datetime(ts, unit="ms").strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": ts,
+        "symbol": _g(r, "symbol", default=""),
+        "side": str(_g(r, "side", default="")).upper(),
+        "executed_qty": qty, "amount": amount, "price": price,
+        "fee": abs(float(_g(r, "fee", "feeAmount", default=0) or 0)),
+        "tax_id": _g(r, "orderId", "positionId", "tax_id", default=None),
+    }
+
+
+def normalize_funding(r: dict) -> dict:
+    ts = int(_g(r, "timestamp", "time", "createTime", default=0))
+    return {
+        "fund_id": str(_g(r, "id", "fundingId", default=f"{ts}-{_g(r,'symbol')}")),
+        "t": pd.to_datetime(ts, unit="ms").strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": ts,
+        "symbol": _g(r, "symbol", default=""),
+        "amount": float(_g(r, "amount", "funding", "fundingFee", default=0) or 0),
+    }
+
+
+def merge_jsonl(path, new_rows, id_key):
+    existing = load_jsonl(path)
+    seen = {r[id_key] for r in existing if id_key in r}
+    added = [r for r in new_rows if r.get(id_key) not in seen]
+    if added:
+        save_jsonl(path, existing + added)
+    return len(added), len(existing) + len(added)
+
+
+def ensure_seed():
+    pos = load_jsonl(POS_FP)
+    if not any(p.get("source") == "seed" for p in pos):
+        seed_from_csv.run()
+
+
+def seed_cutoff_ms():
+    pos = [p for p in load_jsonl(POS_FP) if p.get("source") == "seed"]
+    if not pos:
+        return 0
+    mx = max(pd.to_datetime(p["close_time"]) for p in pos)
+    return int(mx.value // 10**6)
+
+
+def regenerate(side="short"):
+    data = write_data_json(load_jsonl(POS_FP), DATA_FP, side)
+    with open(os.path.join(SITE, "last_update.txt"), "w") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+    k = data.get("kpi", {})
+    print(f"[data] {k.get('n_ops','?')} ops · neto {k.get('total_net','?')} $ · "
+          f"win {k.get('win_rate','?')}% -> {DATA_FP}")
+    return data
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--probe", action="store_true", help="probar endpoints y salir")
+    ap.add_argument("--side", default="short")
+    args = ap.parse_args()
+
+    key = os.environ.get("PIONEX_KEY")
+    secret = os.environ.get("PIONEX_SECRET")
+
+    if args.probe:
+        client = PionexClient(key, secret)
+        print(json.dumps(client.probe(), indent=2, ensure_ascii=False, default=str))
+        return
+
+    ensure_seed()
+
+    # --- pull incremental desde la API (tolerante a fallos) ---
+    try:
+        client = PionexClient(key, secret)
+        state = {}
+        if os.path.exists(STATE_FP):
+            state = json.load(open(STATE_FP))
+        cutoff = seed_cutoff_ms()
+        start_ms = int(state.get("last_ms") or cutoff or (time.time() * 1000 - 90 * DAY_MS))
+        end_ms = int(time.time() * 1000)
+
+        fills = [normalize_fill(r) for r in client.futures_fills(start_ms, end_ms)]
+        funding = [normalize_funding(r) for r in client.futures_funding(start_ms, end_ms)]
+        nf, _ = merge_jsonl(FILLS_FP, fills, "fill_id")
+        ng, _ = merge_jsonl(FUND_FP, funding, "fund_id")
+        print(f"[api] +{nf} fills nuevos · +{ng} pagos de funding nuevos")
+
+        # reconstruir posiciones de la API (posteriores a la semilla) desde TODO el store de fills
+        all_fills = pd.DataFrame(load_jsonl(FILLS_FP))
+        all_fund = pd.DataFrame(load_jsonl(FUND_FP))
+        if not all_fills.empty:
+            all_fills["t"] = pd.to_datetime(all_fills["t"])
+            api_pos = build_positions_from_fills(all_fills, all_fund, since_ms=cutoff, source="api")
+            seed_pos = [p for p in load_jsonl(POS_FP) if p.get("source") == "seed"]
+            # dedupe api por pos_id
+            seen, merged = set(), list(seed_pos)
+            for p in api_pos:
+                if p["pos_id"] not in seen:
+                    seen.add(p["pos_id"]); merged.append(p)
+            save_jsonl(POS_FP, merged)
+
+        json.dump({"last_ms": end_ms}, open(STATE_FP, "w"))
+    except PionexError as e:
+        print(f"[api] sin datos de la API esta vez ({e}). "
+              f"Regenero el dashboard con el store actual.")
+    except Exception as e:
+        print(f"[api] error inesperado ({type(e).__name__}: {e}). "
+              f"Regenero con el store actual.")
+
+    regenerate(args.side)
+
+
+if __name__ == "__main__":
+    main()

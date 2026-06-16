@@ -1,0 +1,180 @@
+"""
+Lógica de reconstrucción de operaciones y cálculo de métricas del dashboard.
+
+- reconstruct_round_trips: agrupa fills en operaciones (round-trips) recorriendo
+  la cantidad neta por activo (lo mismo validado contra el extracto de Pionex).
+- build_positions_from_fills: convierte fills + funding (de la API) en registros
+  de posición unificados.
+- compute_dashboard: a partir de los registros unificados produce el data.json
+  que consume el dashboard.
+
+Registro de posición unificado:
+  pos_id, symbol, activo, side, open_time, close_time,
+  gross, fee, funding, net, capital, n_entries, avg_entry_px, estado, source
+"""
+import json
+import os
+import pandas as pd
+import numpy as np
+
+REBALANCE_ENTRIES = 20  # nº de añadidos a partir del cual lo tratamos como bot
+
+
+def clean_symbol(sym: str) -> str:
+    return str(sym).replace("_PERP", "").replace("_USDT", "/USDT")
+
+
+# ---------------------------------------------------------------- IO
+def load_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def save_jsonl(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------- reconstrucción
+def reconstruct_round_trips(fills: pd.DataFrame):
+    """fills: columnas t(datetime), symbol, side(BUY/SELL), executed_qty, amount,
+    price, fee, tax_id. Devuelve lista de operaciones cerradas (round-trips)."""
+    fills = fills.sort_values("t")
+    trips = []
+    key = "tax_id" if "tax_id" in fills.columns and fills["tax_id"].notna().any() else "symbol"
+    for _, g in fills.groupby(key):
+        net = 0.0
+        cur = None
+        for _, f in g.iterrows():
+            q = float(f["executed_qty"]) * (1 if f["side"] == "SELL" else -1)
+            if cur is None:
+                cur = dict(symbol=f["symbol"], open=f["t"], close=f["t"], first=f["side"],
+                           sell_amt=0.0, buy_amt=0.0, sell_qty=0.0, fee=0.0, secs=set())
+            if f["side"] == "SELL":
+                cur["sell_amt"] += float(f["amount"]); cur["sell_qty"] += float(f["executed_qty"])
+                cur["secs"].add(pd.Timestamp(f["t"]).floor("s"))
+            else:
+                cur["buy_amt"] += float(f["amount"])
+            cur["fee"] += abs(float(f.get("fee", 0) or 0))
+            cur["close"] = f["t"]
+            net += q
+            if abs(net) < 1e-6:
+                cur["n_ent"] = len(cur["secs"])
+                cur["gross"] = cur["sell_amt"] - cur["buy_amt"]
+                trips.append(cur); cur = None
+        if cur is not None:
+            cur["n_ent"] = len(cur["secs"]); cur["gross"] = cur["sell_amt"] - cur["buy_amt"]
+            trips.append(cur)
+    return trips
+
+
+def build_positions_from_fills(fills: pd.DataFrame, funding: pd.DataFrame | None,
+                               since_ms: int = 0, source: str = "api"):
+    """Reconstruye posiciones SHORT a partir de fills (+ funding) de la API."""
+    if fills.empty:
+        return []
+    trips = reconstruct_round_trips(fills)
+    # funding indexado por símbolo para repartir por ventana temporal
+    fund = None
+    if funding is not None and not funding.empty:
+        fund = funding.copy()
+        fund["t"] = pd.to_datetime(fund["t"])
+    out = []
+    for tr in trips:
+        if tr["first"] != "SELL":          # sólo shorts (abren con venta)
+            continue
+        open_t, close_t = pd.Timestamp(tr["open"]), pd.Timestamp(tr["close"])
+        if since_ms and open_t.value // 10**6 <= since_ms:
+            continue                        # ya cubierto por la semilla
+        f_amt = 0.0
+        if fund is not None:
+            m = fund[(fund["symbol"] == tr["symbol"]) & (fund["t"] >= open_t) & (fund["t"] <= close_t)]
+            f_amt = float(m["amount"].sum()) if len(m) else 0.0
+        gross = round(tr["gross"], 6)
+        fee = round(-abs(tr["fee"]), 6)
+        funding_v = round(f_amt, 6)
+        cap = round(tr["sell_amt"], 6)
+        n = int(tr["n_ent"])
+        out.append(dict(
+            pos_id=f"{tr['symbol']}|{close_t.strftime('%Y%m%d%H%M%S')}",
+            symbol=tr["symbol"], activo=clean_symbol(tr["symbol"]), side="short",
+            open_time=open_t.strftime("%Y-%m-%d %H:%M:%S"),
+            close_time=close_t.strftime("%Y-%m-%d %H:%M:%S"),
+            gross=gross, fee=fee, funding=funding_v, net=round(gross + fee + funding_v, 6),
+            capital=cap, n_entries=n,
+            avg_entry_px=(round(tr["sell_amt"] / tr["sell_qty"], 10) if tr["sell_qty"] else None),
+            estado=("Rebalanceo" if n >= REBALANCE_ENTRIES else "OK"),
+            source=source,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------- métricas
+def _fmt(n, d=2):
+    return round(float(n), d)
+
+
+def compute_dashboard(positions: list, side: str = "short") -> dict:
+    rows = [p for p in positions if p.get("side") == side]
+    if not rows:
+        return {"kpi": {}, "days": [], "empty": True}
+    df = pd.DataFrame(rows)
+    df["ct"] = pd.to_datetime(df["close_time"])
+    df["cdate"] = df["ct"].dt.strftime("%Y-%m-%d")
+    df["net_pct"] = np.where((df["capital"].notna()) & (df["capital"] > 0),
+                             df["net"] / df["capital"], np.nan)
+
+    total_net = df["net"].sum()
+    total_gross = df["gross"].sum()
+    total_fee = df["fee"].sum()
+    total_fund = df["funding"].sum()
+    n_ops = len(df)
+    wins = int((df["net"] > 0).sum())
+    losses = int((df["net"] <= 0).sum())
+    ndays = df["cdate"].nunique()
+    ok = df[df["estado"] == "OK"]
+    avg_pct = ok["net_pct"].mean() * 100 if len(ok) and ok["net_pct"].notna().any() else 0.0
+
+    days = []
+    for dt, g in df.groupby("cdate"):
+        okg = g[g["estado"] == "OK"]
+        dpct = okg["net_pct"].mean() * 100 if len(okg) and okg["net_pct"].notna().any() else None
+        ops = []
+        for _, x in g.sort_values("ct").iterrows():
+            pct = (round(float(x["net_pct"]) * 100, 2)
+                   if pd.notna(x["net_pct"]) and x["estado"] == "OK" else None)
+            ops.append(dict(activo=x["activo"], net=_fmt(x["net"]),
+                            pct=pct, n=(int(x["n_entries"]) if pd.notna(x["n_entries"]) else None),
+                            est=x["estado"]))
+        days.append(dict(date=dt, net=_fmt(g["net"].sum()),
+                         pct=(round(dpct, 2) if dpct is not None else None),
+                         nops=len(g), wins=int((g["net"] > 0).sum()), ops=ops))
+    days.sort(key=lambda r: r["date"])
+
+    best = max(days, key=lambda r: r["net"])
+    worst = min(days, key=lambda r: r["net"])
+    return {
+        "generated_at": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "kpi": dict(
+            total_net=_fmt(total_net), total_gross=_fmt(total_gross),
+            total_fee=_fmt(total_fee), total_fund=_fmt(total_fund),
+            win_rate=_fmt(wins / n_ops * 100, 1), avg_pct=_fmt(avg_pct),
+            avg_daily=_fmt(total_net / ndays), n_ops=n_ops, wins=wins, losses=losses,
+            ndays=ndays,
+            best=dict(date=best["date"], net=best["net"]),
+            worst=dict(date=worst["date"], net=worst["net"]),
+        ),
+        "days": days,
+    }
+
+
+def write_data_json(positions, out_path, side="short"):
+    data = compute_dashboard(positions, side)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return data

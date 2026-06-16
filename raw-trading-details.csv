@@ -1,0 +1,119 @@
+"""
+Cliente REST firmado para la API de Pionex.
+
+Firma (según docs oficiales):
+  - timestamp en milisegundos, va en el query string Y forma parte de la firma
+  - pares key=value ordenados por ASCII ascendente, unidos con '&'
+  - PATH_URL = PATH + '?' + query
+  - prehash = METHOD + PATH_URL  (+ body para POST/DELETE)
+  - PIONEX-SIGNATURE = HMAC_SHA256(secret, prehash) en hex
+  - headers: PIONEX-KEY, PIONEX-SIGNATURE
+
+NOTA IMPORTANTE: la API de FUTUROS de Pionex es "invite-only / beta". Los paths
+de abajo son los publicados en la documentación, pero pueden variar según tu
+acceso. Si algo falla, ejecuta `python collector/collect.py --probe` para ver la
+respuesta cruda y ajustar ENDPOINTS o el mapeo de campos en compute.py.
+"""
+import hashlib
+import hmac
+import time
+import requests
+
+BASE_URL = "https://api.pionex.com"
+
+# Paths de la API de futuros. Ajusta aquí si tu documentación difiere.
+ENDPOINTS = {
+    "fills":          "/uapi/v1/trade/fills",          # ejecuciones (fills), orden desc por tiempo
+    "history_orders": "/uapi/v1/trade/historyOrders",  # órdenes cerradas
+    "funding":        "/uapi/v1/trade/fundingFees",    # pagos de funding
+    "positions":      "/uapi/v1/trade/positions",      # posiciones abiertas (estado actual)
+}
+
+
+class PionexError(RuntimeError):
+    pass
+
+
+class PionexClient:
+    def __init__(self, api_key: str, api_secret: str, base_url: str = BASE_URL, timeout: int = 20):
+        if not api_key or not api_secret:
+            raise PionexError("Faltan PIONEX_KEY / PIONEX_SECRET en el entorno.")
+        self.key = api_key
+        self.secret = api_secret.encode()
+        self.base = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+
+    def _sign(self, method: str, path: str, params: dict, body: str = ""):
+        params = {k: v for k, v in params.items() if v not in (None, "")}
+        params["timestamp"] = str(int(time.time() * 1000))
+        # orden ASCII ascendente por clave, sin url-encoding
+        query = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        path_url = f"{path}?{query}"
+        prehash = method + path_url + (body or "")
+        sig = hmac.new(self.secret, prehash.encode(), hashlib.sha256).hexdigest()
+        return query, sig
+
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        query, sig = self._sign("GET", path, params or {})
+        url = f"{self.base}{path}?{query}"
+        headers = {"PIONEX-KEY": self.key, "PIONEX-SIGNATURE": sig}
+        r = self.session.get(url, headers=headers, timeout=self.timeout)
+        try:
+            data = r.json()
+        except Exception:
+            raise PionexError(f"Respuesta no-JSON ({r.status_code}): {r.text[:200]}")
+        if not data.get("result", False):
+            raise PionexError(f"Error API [{data.get('code')}]: {data.get('message')} ({path})")
+        return data.get("data", {})
+
+    # ---- helpers de paginación por tiempo (descendente -> recogemos hacia atrás) ----
+    def _paged(self, path: str, start_ms: int, end_ms: int, list_key: str,
+               extra: dict | None = None, page_limit: int = 200, max_pages: int = 200):
+        out, cursor_end, pages = [], end_ms, 0
+        while pages < max_pages:
+            params = {"startTime": start_ms, "endTime": cursor_end, "limit": page_limit}
+            if extra:
+                params.update(extra)
+            data = self._get(path, params)
+            rows = data.get(list_key) or data.get("list") or data.get("data") or []
+            if not rows:
+                break
+            out.extend(rows)
+            # avanzar el cursor a justo antes del registro más antiguo de esta página
+            times = [int(r.get("timestamp") or r.get("createTime") or r.get("time") or 0) for r in rows]
+            oldest = min(t for t in times if t) if any(times) else None
+            if not oldest or oldest <= start_ms or len(rows) < page_limit:
+                break
+            cursor_end = oldest - 1
+            pages += 1
+        return out
+
+    def futures_fills(self, start_ms: int, end_ms: int, symbol: str | None = None):
+        extra = {"symbol": symbol} if symbol else None
+        return self._paged(ENDPOINTS["fills"], start_ms, end_ms, "fills", extra)
+
+    def futures_funding(self, start_ms: int, end_ms: int, symbol: str | None = None):
+        extra = {"symbol": symbol} if symbol else None
+        return self._paged(ENDPOINTS["funding"], start_ms, end_ms, "fundingFees", extra,
+                           page_limit=500)
+
+    def futures_history_orders(self, start_ms: int, end_ms: int, symbol: str | None = None):
+        extra = {"symbol": symbol} if symbol else None
+        return self._paged(ENDPOINTS["history_orders"], start_ms, end_ms, "orders", extra,
+                           page_limit=200)
+
+    def probe(self):
+        """Llama a cada endpoint con una ventana corta y devuelve la respuesta cruda
+        para verificar paths y nombres de campos sin procesar nada."""
+        end = int(time.time() * 1000)
+        start = end - 3 * 24 * 3600 * 1000  # últimos 3 días
+        report = {}
+        for name, fn in (("fills", lambda: self._get(ENDPOINTS["fills"], {"startTime": start, "endTime": end, "limit": 5})),
+                         ("funding", lambda: self._get(ENDPOINTS["funding"], {"startTime": start, "endTime": end, "limit": 5})),
+                         ("history_orders", lambda: self._get(ENDPOINTS["history_orders"], {"startTime": start, "endTime": end, "limit": 5}))):
+            try:
+                report[name] = {"ok": True, "sample": fn()}
+            except Exception as e:
+                report[name] = {"ok": False, "error": str(e)}
+        return report
