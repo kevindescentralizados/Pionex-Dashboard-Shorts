@@ -393,10 +393,11 @@ def load_pioneer_csv(path: str) -> list:
                 "fee":        round(fee, 6),
                 "funding":    round(funding, 6),
                 "net":        net,
-                "capital":    0,
-                "n_entries":  1,
-                "avg_entry_px": 0,
-                "estado":     "OK",
+                "capital":    float(row.get("capital", 0) or 0),
+                "n_entries":  int(float(row.get("n_entries", 1) or 1)),
+                "avg_entry_px": float(row.get("avg_entry_px", 0) or 0),
+                "pct":        float(row.get("pct", 0) or 0),
+                "estado":     str(row.get("estado", "OK") or "OK"),
                 "source":     "pioneer_csv",
             })
         print(f"[collect] Pioneer CSV: {len(recs)} registros cargados desde {os.path.basename(path)}.")
