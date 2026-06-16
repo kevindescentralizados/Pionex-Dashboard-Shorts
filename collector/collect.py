@@ -361,6 +361,51 @@ def build_data_json(records: list) -> dict:
 
 # ── main ────────────────────────────────────────────────────────────────────
 
+# ── fuente 3: positions.jsonl en root (CSV exportado de Pionex) ──────────────
+
+def load_pioneer_csv(path: str) -> list:
+    """Lee el positions.jsonl del root, que en realidad es un CSV de Pionex
+    con columnas: position_id, symbol, position_side, open_time, close_time, pnl, fee, funding_fee"""
+    if not os.path.exists(path):
+        return []
+    try:
+        df = pd.read_csv(path)
+        df.columns = [c.strip().strip('"') for c in df.columns]
+        required = {"position_id", "symbol", "pnl", "fee", "funding_fee"}
+        if not required.issubset(set(df.columns)):
+            print(f"[collect] positions.jsonl del root no tiene columnas esperadas: {list(df.columns)}")
+            return []
+        recs = []
+        for _, row in df.iterrows():
+            gross  = float(row.get("pnl", 0) or 0)
+            fee    = float(row.get("fee", 0) or 0)
+            funding = float(row.get("funding_fee", 0) or 0)
+            net    = round(gross + fee + funding, 6)
+            sym    = str(row.get("symbol", "")).strip()
+            recs.append({
+                "pos_id":     str(row.get("position_id", "")).strip(),
+                "symbol":     sym,
+                "activo":     clean_symbol(sym),
+                "side":       str(row.get("position_side", "short")).strip(),
+                "open_time":  str(row.get("open_time", "")).strip(),
+                "close_time": str(row.get("close_time", "")).strip(),
+                "gross":      round(gross, 6),
+                "fee":        round(fee, 6),
+                "funding":    round(funding, 6),
+                "net":        net,
+                "capital":    0,
+                "n_entries":  1,
+                "avg_entry_px": 0,
+                "estado":     "OK",
+                "source":     "pioneer_csv",
+            })
+        print(f"[collect] Pioneer CSV: {len(recs)} registros cargados desde {os.path.basename(path)}.")
+        return recs
+    except Exception as e:
+        print(f"[collect] Error leyendo Pioneer CSV: {e}")
+        return []
+
+
 def main():
     print("[collect] ── Iniciando recoleccion ──")
 
@@ -374,11 +419,14 @@ def main():
     # 3. Sembrar desde CSV (backfill historico)
     csv_recs = seed_from_csv(ROOT)
 
+    # 3b. Cargar positions.jsonl del root (CSV de Pionex exportado)
+    pioneer_recs = load_pioneer_csv(os.path.join(ROOT, "positions.jsonl"))
+
     # 4. Combinar: CSV como base historica, API sobre escribe/añade lo nuevo
     #    - CSV seed source="seed", API source="api"
     #    - Deduplicar por pos_id
     all_by_id = {}
-    for r in csv_recs:
+    for r in csv_recs + pioneer_recs:
         pid = r.get("pos_id","")
         if pid:
             all_by_id[pid] = r
@@ -387,7 +435,7 @@ def main():
         if pid:
             all_by_id[pid] = r   # API tiene prioridad
     # Registros sin pos_id (no deberia pasar pero por si acaso)
-    no_id = [r for r in csv_recs + api_recs if not r.get("pos_id")]
+    no_id = [r for r in csv_recs + pioneer_recs + api_recs if not r.get("pos_id")]
     all_records = list(all_by_id.values()) + no_id
 
     if not all_records:
