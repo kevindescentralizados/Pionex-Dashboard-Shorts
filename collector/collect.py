@@ -310,6 +310,11 @@ def build_data_json(records: list) -> dict:
     if len(has_cap):
         has_cap["pct"] = has_cap["net"] / has_cap["capital"] * 100
         avg_pct = round(has_cap["pct"].mean(), 4)
+    elif "pct" in df.columns:
+        # Usar pct directo del record si capital no disponible
+        has_pct = df[df["pct"].notna() & (df["pct"] != 0)]
+        if len(has_pct):
+            avg_pct = round(has_pct["pct"].mean(), 4)
 
     daily  = df.groupby("date").agg(
         net   =("net",  "sum"),
@@ -332,7 +337,13 @@ def build_data_json(records: list) -> dict:
         ops_out = []
         for _, op in day_ops_df.sort_values("ct").iterrows():
             op_cap = op["capital"] if pd.notna(op.get("capital")) and op["capital"] > 0 else None
-            op_pct = round(op["net"] / op_cap * 100, 2) if op_cap else None
+            _rec_pct = float(op.get("pct", 0) or 0)
+            if op_cap:
+                op_pct = round(op["net"] / op_cap * 100, 2)
+            elif _rec_pct:
+                op_pct = round(_rec_pct, 2)
+            else:
+                op_pct = None
             ops_out.append(dict(
                 activo=op["activo"], est=op["estado"],
                 n=int(op["n_entries"]) if pd.notna(op.get("n_entries")) else None,
